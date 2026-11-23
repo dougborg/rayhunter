@@ -55,6 +55,7 @@ pub struct Feed {
     buffer: Mutex<Buffer>,
     next_sequence: AtomicU64,
     source_alive: AtomicBool,
+    recording_known: AtomicBool,
     oversized: AtomicU64,
     contended: AtomicU64,
     notify: Notify,
@@ -81,7 +82,12 @@ impl Publisher {
         if raw.len() > MAX_READ {
             self.feed.oversized.fetch_add(1, Ordering::Relaxed);
         } else if let Ok(mut buffer) = self.feed.buffer.try_lock() {
-            let metadata = json!({"sequence":sequence, "recording_id":buffer.recording,
+            let recording = if self.feed.recording_known.load(Ordering::Acquire) {
+                buffer.recording.as_deref()
+            } else {
+                None
+            };
+            let metadata = json!({"sequence":sequence, "recording_id":recording,
                 "read_monotonic_ns":self.origin.elapsed().as_nanos() as u64,
                 "read_system_unix_ns":SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|t|t.as_nanos().to_string()),
                 "raw_length":raw.len()});
@@ -135,6 +141,7 @@ impl Feed {
             buffer: Mutex::new(Buffer::default()),
             next_sequence: AtomicU64::new(0),
             source_alive: AtomicBool::new(true),
+            recording_known: AtomicBool::new(true),
             oversized: AtomicU64::new(0),
             contended: AtomicU64::new(0),
             notify: Notify::new(),
@@ -143,8 +150,15 @@ impl Feed {
         }))
     }
     pub fn set_recording(&self, name: Option<&str>) {
-        self.buffer.lock().expect("raw ring poisoned").recording =
-            name.filter(|s| s.len() <= 256).map(str::to_owned);
+        // Called by the same diagnostic task as publish; never wait for a
+        // consumer. If the update loses the lock, report unknown rather than
+        // attaching the previous recording to subsequent reads.
+        if let Ok(mut buffer) = self.buffer.try_lock() {
+            buffer.recording = name.filter(|s| s.len() <= 256).map(str::to_owned);
+            self.recording_known.store(true, Ordering::Release);
+        } else {
+            self.recording_known.store(false, Ordering::Release);
+        }
     }
     fn item(&self, cursor: u64) -> Option<Item> {
         let buffer = self.buffer.lock().expect("raw ring poisoned");

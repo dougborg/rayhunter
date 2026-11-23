@@ -370,3 +370,23 @@ async fn busy_stream_cancellation_releases_clients() {
     .await
     .unwrap();
 }
+
+#[test]
+fn recording_context_update_never_waits_and_never_reuses_stale_id() {
+    let mut p = publisher();
+    p.feed.set_recording(Some("previous-recording"));
+    let held = p.feed.buffer.lock().unwrap();
+    p.feed.set_recording(Some("new-recording"));
+    drop(held);
+    p.publish(b"context unknown after contention");
+    let Some(Item::Record(record)) = p.feed.item(0) else {
+        panic!("missing")
+    };
+    assert!(decode(&record.frame).0["recording_id"].is_null());
+    p.feed.set_recording(Some("new-recording"));
+    p.publish(b"context recovered");
+    let Some(Item::Record(record)) = p.feed.item(1) else {
+        panic!("missing")
+    };
+    assert_eq!(decode(&record.frame).0["recording_id"], "new-recording");
+}

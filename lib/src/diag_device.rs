@@ -183,10 +183,10 @@ impl DiagDevice {
                 .read(&mut self.read_buf)
                 .await
                 .map_err(DiagDeviceError::DeviceReadFailed)?;
-            if bytes_read > 0 {
-                if let Some(observer) = &mut self.raw_read_observer {
-                    observer(&self.read_buf[..bytes_read]);
-                }
+            if bytes_read > 0
+                && let Some(observer) = &mut self.raw_read_observer
+            {
+                observer(&self.read_buf[..bytes_read]);
             }
         }
 

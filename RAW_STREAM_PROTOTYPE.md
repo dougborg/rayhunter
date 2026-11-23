@@ -51,7 +51,7 @@ Metadata contains `sequence` (u64), `raw_length`, `recording_id` (nullable),
 `read_monotonic_ns` (u64, elapsed since source creation) and
 `read_system_unix_ns` (decimal string, or null before UNIX epoch).
 A recording ID is the active store entry name at read time, not a guarantee
-that those bytes reached disk. Unknown or over-256-byte names are null.
+that those bytes reached disk. Unknown, contended-update or over-256-byte names are null.
 Timestamp provenance is the userspace read callback, **not RF arrival**.
 Wall time can jump when the device clock is corrected. No GNSS synchronization,
 offset estimate or uncertainty bound is claimed. Use the stream epoch together
