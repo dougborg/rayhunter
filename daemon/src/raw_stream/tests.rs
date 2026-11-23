@@ -47,6 +47,38 @@ fn exact_bytes_framing_and_recording_context() {
     };
     assert!(decode(&record.frame).0["recording_id"].is_null());
 }
+
+#[tokio::test]
+async fn busy_recording_store_never_delays_reader_or_reuses_stale_context() {
+    use crate::{config::GpsMode, diag::update_raw_recording_context, qmdl_store::RecordingStore};
+    use tokio::sync::RwLock;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = RecordingStore::create(directory.path()).await.unwrap();
+    store.new_entry(GpsMode::Disabled).await.unwrap();
+    let current_name = store.get_current_entry().unwrap().1.name.clone();
+    let store = RwLock::new(store);
+    let mut p = publisher();
+    p.feed.set_recording(Some("previous-recording"));
+
+    // The synchronous telemetry path must return while a filesystem operation
+    // owns the writer, without attaching the previous recording to new bytes.
+    let writer = store.write().await;
+    update_raw_recording_context(&p.feed, &store);
+    p.publish(&[1, 2, 3]);
+    let Some(Item::Record(record)) = p.feed.item(0) else {
+        panic!("missing record while recording store is busy")
+    };
+    assert!(decode(&record.frame).0["recording_id"].is_null());
+
+    drop(writer);
+    update_raw_recording_context(&p.feed, &store);
+    p.publish(&[4]);
+    let Some(Item::Record(record)) = p.feed.item(1) else {
+        panic!("missing record after recording store becomes available")
+    };
+    assert_eq!(decode(&record.frame).0["recording_id"], current_name);
+}
 #[test]
 fn count_and_byte_limits_evict_with_explicit_cursor_gap() {
     let mut p = publisher();

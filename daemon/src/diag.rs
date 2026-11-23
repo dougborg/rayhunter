@@ -547,8 +547,7 @@ pub fn run_diag_read_thread(
                         },
                     }
                     if let Some(feed) = &raw_feed {
-                        let store = qmdl_store_lock.read().await;
-                        feed.set_recording(store.get_current_entry().map(|(_, entry)| entry.name.as_str()));
+                        update_raw_recording_context(feed, &qmdl_store_lock);
                     }
                 }
                 maybe_container = diag_stream.next() => {
@@ -569,6 +568,23 @@ pub fn run_diag_read_thread(
             }
         }
     });
+}
+
+/// Stream metadata must not add a wait behind recording-store filesystem work.
+pub(crate) fn update_raw_recording_context(
+    feed: &crate::raw_stream::Feed,
+    store: &RwLock<RecordingStore>,
+) {
+    match store.try_read() {
+        Ok(store) => {
+            feed.set_recording(
+                store
+                    .get_current_entry()
+                    .map(|(_, entry)| entry.name.as_str()),
+            );
+        }
+        Err(_) => feed.set_recording(None),
+    }
 }
 
 /// Start recording API for web thread
