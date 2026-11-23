@@ -20,13 +20,14 @@ pq-tls = ["reqwest/rustls-tls-webpki-roots-no-provider", "dep:rustls-post-quantu
 apidocs = ["dep:utoipa", "wifi-station/utoipa"]
 
 [dependencies]
+bytes = "1.11.1"
 rayhunter = { path = "../lib" }
 wifi-station = "0.10.1"
 toml = "0.8.8"
 serde = { version = "1.0.193", features = ["derive"] }
 serde_repr = "0.1"
 tokio = { version = "1.44.2", default-features = false, features = ["fs", "signal", "process", "rt", "time"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "ws"] }
 thiserror = "1.0.52"
 libc = "0.2.150"
 log = "0.4.20"
@@ -56,3 +57,5 @@ url = "2.5.4"
 [dev-dependencies]
 reqwest = { version = "0.12.20", default-features = false, features = ["gzip"] }
 tempfile = "3.10.2"
+
+tokio-tungstenite = "0.26.2"

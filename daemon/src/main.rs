@@ -11,6 +11,7 @@ mod key_input;
 mod notifications;
 mod pcap;
 mod qmdl_store;
+mod raw_stream;
 mod server;
 mod stats;
 mod update;
@@ -225,6 +226,14 @@ async fn run_with_config(
     let notification_service = NotificationService::new(config.ntfy_url.clone());
     let update_status_lock = Arc::new(RwLock::new(UpdateStatus::default()));
 
+    let raw_stream = raw_stream::start(
+        config.raw_stream_port,
+        config.debug_mode,
+        &task_tracker,
+        shutdown_token.clone(),
+    )
+    .await?;
+
     if !config.debug_mode {
         info!("Starting Diag Thread");
         let gps_fixed_coords = match (config.gps_fixed_latitude, config.gps_fixed_longitude) {
@@ -245,6 +254,7 @@ async fn run_with_config(
             config.min_space_to_continue_recording_mb,
             config.gps_mode,
             gps_fixed_coords,
+            raw_stream,
         );
         info!("Starting UI");
 

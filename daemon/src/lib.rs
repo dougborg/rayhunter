@@ -11,6 +11,7 @@ pub mod key_input;
 pub mod notifications;
 pub mod pcap;
 pub mod qmdl_store;
+pub mod raw_stream;
 pub mod server;
 pub mod stats;
 pub mod update;
