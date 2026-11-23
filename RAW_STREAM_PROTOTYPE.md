@@ -6,8 +6,8 @@ It is not an upstream proposal or a production firmware release.
 
 ## Enable and connect
 
-Add `"raw_stream_port": 8082` to the existing Rayhunter JSON configuration and
-restart the daemon. Omit the field or use `null` to disable it (the default).
+Add `raw_stream_port = 8082` to the top level of the existing Rayhunter TOML
+configuration and restart the daemon. Omit the field to disable it (the default).
 Debug mode always disables it. Port zero is rejected. Failure to bind the port
 fails startup rather than silently claiming the stream is available.
 
