@@ -1,8 +1,9 @@
 # Raw diagnostic stream prototype
 
 Fork-local experiment for AirHound integration. This code and its tests/docs were
-created with AI assistance and still require human review and device acceptance.
-It is not an upstream proposal or a production firmware release.
+created with AI assistance. One bounded Orbic validation has passed; broader
+device acceptance and human review remain. It is not an upstream proposal or a
+production firmware release.
 
 ## Enable and connect
 
@@ -16,7 +17,7 @@ normal HTTP server, which may listen on the hotspot. Connect with WebSocket
 subprotocol `rayhunter.raw-diag.v1` to `ws://127.0.0.1:8082/raw-diag`.
 For a USB-attached Orbic, an explicitly established local ADB tunnel such as
 `adb forward tcp:18082 tcp:8082` permits a client to use localhost port 18082.
-This tunnel has not yet been validated on hardware with this prototype.
+This tunnel was exercised in the bounded Orbic validation described below.
 There is no authentication or TLS on this loopback-only listener. Local processes
 and explicitly forwarded connections can read it. Browser Origin headers are
 rejected. Do not expose the forward on a public interface.
@@ -88,7 +89,8 @@ and the next hello to recognize reconnect loss within the same epoch.
 - The producer never awaits a consumer, network write or contended ring lock.
   On lock contention it discards that feed read and advances the sequence.
   Old records are evicted for byte/count limits. Copies and allocations up to
-  the per-read limit still add capture overhead, to be measured on the Orbic.
+  the per-read limit still add capture overhead. Sustained-load measurements and
+  a comparative assessment of that overhead remain pending.
 
 The sequence/gaps describe this fork's feed loss only. Modem/kernel/RF loss is
 unknown. No raw ambient samples are committed in this branch.
@@ -117,7 +119,46 @@ without dependencies, hardware, raw ambient samples or a running daemon. With
 `websockets` installed in a private Python virtual environment, passing a local
 WebSocket URL prints metadata and byte counts only. It does not persist raw data.
 
-Before device deployment: independent adversarial review, target cross-build,
-Orbic CPU/RSS/throughput measurement, source-read-size measurement, USB-forward
-verification, recorder integrity comparison and deliberate slow/disconnected
-client soak. There is no firmware installation or modem change in these tests.
+### Bounded Orbic validation
+
+On November 23, 2026, an independently reviewed test exercised implementation
+`7de225d` on an Orbic running official Rayhunter 0.13.0. The static ARMv7 binary
+was cross-built with the `firmware-devel` profile, default RustCrypto TLS and
+Rust 1.98.1 (upstream pins 1.98.0). This was not the official post-quantum release
+build. The prototype used a separate binary, configuration and recording store;
+the installed official software and configuration were unchanged.
+
+The test temporarily stopped the official daemon, ran the prototype with the
+feed disabled and then enabled, and restored the official daemon through a
+normal reboot. The complete test and verified recovery took 116.84 seconds.
+
+- The USB-forwarded WebSocket client received 73 binary messages containing
+  63,699 raw bytes over 27.05 seconds. The largest observed read was 1,662 bytes.
+  No feed gaps were observed during that sample; RF loss remains unknown.
+- The raw listener was absent when disabled and bound only to loopback when
+  enabled. The normal HTTP server returned 404 for `/raw-diag`.
+- A third client received HTTP 429. A reconnect started at the current sequence
+  rather than replaying retained data.
+- Both prototype phases produced finalized recordings that passed gzip
+  integrity checks. This verifies compressed-file integrity, not complete
+  decoding or a byte-for-byte comparison between recordings and the feed.
+- Recovery verified the official daemon's full capabilities, preservation of
+  all 62 previously inventoried immutable files, and resumed QMDL growth.
+  The test's owned ADB forwards were removed.
+
+The client retained aggregate validation results, not raw WebSocket payloads.
+Diagnostic recordings remained private. No firmware installation, logging-mask
+change or baseband change was made. Official Rayhunter 0.13.0 was left recording.
+
+### Remaining acceptance work
+
+This short run does not establish sustained throughput, comparative CPU/memory
+overhead, RF completeness, or endurance. A non-reading client was present, but
+the run did not demonstrate buffer saturation, eviction or an overload gap;
+deliberate slow-client and disconnect soaks remain necessary. Diagnostic-source
+termination and failure recovery also need hardware validation.
+
+AirHound live ingestion and cellular alert acceptance are not implemented or
+validated by this test. There is still no replay API, RF-loss estimate, I/Q
+capture, or GNSS clock-alignment guarantee. Keep this fork as a prototype until
+the remaining checks and human review are complete.
