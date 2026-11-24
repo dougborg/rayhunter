@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
+    "airhound-source",
     "lib",
     "daemon",
     "check",
