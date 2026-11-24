@@ -4652,6 +4652,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayhunter-airhound-source"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "rayhunter",
+ "serde_json",
+ "sha2",
+ "telcom-parser",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "rayhunter-check"
 version = "0.13.0"
 dependencies = [
