@@ -475,11 +475,16 @@ pub fn run_diag_read_thread(
     min_space_to_continue_mb: u64,
     gps_mode: GpsMode,
     gps_fixed_coords: Option<(f64, f64)>,
+    raw_publisher: Option<crate::raw_stream::Publisher>,
 ) {
     task_tracker.spawn(async move {
         info!("Using configuration for device: {0:?}", device);
         let mut dev = DiagDevice::new(&device)
             .await?;
+        let raw_feed = raw_publisher.as_ref().map(|publisher| publisher.feed());
+        if let Some(mut publisher) = raw_publisher {
+            dev.set_raw_read_observer(move |bytes| publisher.publish(bytes));
+        }
         dev.config_logs()
             .await?;
 
@@ -541,12 +546,18 @@ pub fn run_diag_read_thread(
                             diag_task.handle_gps_update(&qmdl_store, lat, lon).await;
                         },
                     }
+                    if let Some(feed) = &raw_feed {
+                        update_raw_recording_context(feed, &qmdl_store_lock);
+                    }
                 }
                 maybe_container = diag_stream.next() => {
                     match maybe_container.unwrap() {
                         Ok(container) => {
                             let mut qmdl_store = qmdl_store_lock.write().await;
-                            diag_task.process_container(qmdl_store.deref_mut(), container).await
+                            diag_task.process_container(qmdl_store.deref_mut(), container).await;
+                            if let Some(feed) = &raw_feed {
+                                feed.set_recording(qmdl_store.get_current_entry().map(|(_, entry)| entry.name.as_str()));
+                            }
                         },
                         Err(err) => {
                             error!("error reading diag device: {err}");
@@ -557,6 +568,23 @@ pub fn run_diag_read_thread(
             }
         }
     });
+}
+
+/// Stream metadata must not add a wait behind recording-store filesystem work.
+pub(crate) fn update_raw_recording_context(
+    feed: &crate::raw_stream::Feed,
+    store: &RwLock<RecordingStore>,
+) {
+    match store.try_read() {
+        Ok(store) => {
+            feed.set_recording(
+                store
+                    .get_current_entry()
+                    .map(|(_, entry)| entry.name.as_str()),
+            );
+        }
+        Err(_) => feed.set_recording(None),
+    }
 }
 
 /// Start recording API for web thread

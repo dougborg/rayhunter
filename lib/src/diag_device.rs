@@ -87,10 +87,13 @@ const DIAG_IOCTL_SWITCH_LOGGING: u64 = 7;
 #[cfg(all(not(target_env = "musl"), target_arch = "aarch64"))]
 const DIAG_IOCTL_SWITCH_LOGGING: u64 = 7;
 
+type RawReadObserver = Box<dyn FnMut(&[u8]) + Send>;
+
 pub struct DiagDevice {
     file: File,
     read_buf: Vec<u8>,
     use_mdm: i32,
+    raw_read_observer: Option<RawReadObserver>,
 }
 
 impl DiagDevice {
@@ -152,7 +155,14 @@ impl DiagDevice {
             read_buf: vec![0; BUFFER_LEN],
             file: diag_file,
             use_mdm,
+            raw_read_observer: None,
         })
+    }
+
+    /// Observe exact positive device reads before parsing. The callback must not
+    /// block, perform I/O, or change device configuration. Disabled by default.
+    pub fn set_raw_read_observer(&mut self, observer: impl FnMut(&[u8]) + Send + 'static) {
+        self.raw_read_observer = Some(Box::new(observer));
     }
 
     pub fn as_stream(
@@ -173,6 +183,11 @@ impl DiagDevice {
                 .read(&mut self.read_buf)
                 .await
                 .map_err(DiagDeviceError::DeviceReadFailed)?;
+            if bytes_read > 0
+                && let Some(observer) = &mut self.raw_read_observer
+            {
+                observer(&self.read_buf[..bytes_read]);
+            }
         }
 
         debug!(
@@ -370,4 +385,34 @@ fn determine_use_mdm(fd: i32) -> DiagResult<i32> {
         }
     }
     Ok(use_mdm)
+}
+
+#[cfg(test)]
+mod raw_observer_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn raw_observer_receives_malformed_device_read_before_parse_error() {
+        // An ordinary file exercises the real read path without opening /dev/diag.
+        let raw = [255_u8; 17];
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(temporary.path(), raw).await.unwrap();
+        let file = File::open(temporary.path()).await.unwrap();
+        let mut device = DiagDevice {
+            file,
+            read_buf: vec![0; BUFFER_LEN],
+            use_mdm: 0,
+            raw_read_observer: None,
+        };
+        assert!(device.raw_read_observer.is_none());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let copy = seen.clone();
+        device.set_raw_read_observer(move |read| copy.lock().unwrap().push(read.to_vec()));
+        assert!(matches!(
+            device.get_next_messages_container().await,
+            Err(DiagDeviceError::ParseMessagesContainerError(_))
+        ));
+        assert_eq!(*seen.lock().unwrap(), vec![raw.to_vec()]);
+    }
 }

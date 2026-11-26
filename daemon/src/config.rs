@@ -64,6 +64,8 @@ pub struct Config {
     pub qmdl_store_path: String,
     /// Listening port
     pub port: u16,
+    /// Optional raw diagnostic WebSocket listener, restricted to 127.0.0.1.
+    pub raw_stream_port: Option<u16>,
     /// Debug mode
     pub debug_mode: bool,
     /// Internal device name
@@ -148,6 +150,7 @@ impl Default for Config {
         Config {
             qmdl_store_path: "/data/rayhunter/qmdl".to_string(),
             port: 8080,
+            raw_stream_port: None,
             debug_mode: false,
             device: Device::Orbic,
             ui_level: UiLevel::Subtle,
