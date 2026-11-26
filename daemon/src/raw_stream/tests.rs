@@ -4,6 +4,38 @@ use tokio_tungstenite::{
     tungstenite::{Message as ClientMessage, client::IntoClientRequest},
 };
 
+// Freeze production send/heartbeat timers while real loopback I/O completes.
+// Blocking channel work prevents Tokio's paused clock from auto-advancing.
+// The real-time watchdog only diagnoses a hung fixture; it never drives success.
+async fn manual_time<F: std::future::Future>(future: F) -> F::Output {
+    struct Resume(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+            tokio::time::resume();
+        }
+    }
+    tokio::time::pause();
+    let (release, wait) = std::sync::mpsc::channel();
+    let mut guard = Resume(Some(release));
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let mut watchdog = tokio::task::spawn_blocking(move || {
+        entered.send(()).unwrap();
+        wait.recv_timeout(Duration::from_secs(30)).is_err()
+    });
+    started.await.unwrap();
+    let result = tokio::select! {
+        biased;
+        ended = &mut watchdog => panic!("raw stream I/O watchdog expired: {ended:?}"),
+        result = future => result,
+    };
+    guard.0.take().unwrap().send(()).unwrap();
+    assert!(!watchdog.await.unwrap(), "raw stream I/O watchdog expired");
+    result
+}
+
 fn publisher() -> Publisher {
     Publisher {
         feed: Feed::new(CancellationToken::new()).unwrap(),
@@ -165,6 +197,13 @@ async fn test_server(p: &Publisher) -> (String, tokio::task::JoinHandle<()>) {
     });
     (url, task)
 }
+// Taking all permits completes only after every upgraded client releases its
+// owned slot. No wall-clock deadline or scheduler polling establishes cleanup.
+async fn clients_released(feed: &Feed) {
+    let permits = feed.clients.acquire_many(MAX_CLIENTS as u32).await.unwrap();
+    drop(permits);
+    assert_eq!(feed.clients.available_permits(), MAX_CLIENTS);
+}
 async fn connect(
     url: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -178,94 +217,93 @@ async fn connect(
 }
 #[tokio::test]
 async fn websocket_exact_frame_live_baseline_limits_and_cancellation() {
-    let mut p = publisher();
-    p.publish(b"before subscription");
-    let (url, task) = test_server(&p).await;
-    let mut ws = connect(&url).await;
-    let hello = ws.next().await.unwrap().unwrap().into_text().unwrap();
-    let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
-    assert_eq!(hello["type"], "hello");
-    assert_eq!(hello["next_sequence"], 1);
-    assert_eq!(hello["replay"], false);
-    p.publish(&[0, 255, 7, 0x7e]);
-    let data = timeout(Duration::from_secs(2), async {
-        loop {
+    manual_time(async {
+        let mut p = publisher();
+        p.publish(b"before subscription");
+        let (url, task) = test_server(&p).await;
+        let mut ws = connect(&url).await;
+        let hello = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["next_sequence"], 1);
+        assert_eq!(hello["replay"], false);
+        p.publish(&[0, 255, 7, 0x7e]);
+        let data = loop {
             if let ClientMessage::Binary(data) = ws.next().await.unwrap().unwrap() {
                 break data;
             }
-        }
+        };
+        assert_eq!(decode(&data).0["sequence"], 1);
+        assert_eq!(decode(&data).1, &[0, 255, 7, 0x7e]);
+        let mut second = connect(&url).await;
+        let _ = second.next().await.unwrap().unwrap();
+        let mut third = url.as_str().into_client_request().unwrap();
+        third
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", PROTOCOL.parse().unwrap());
+        let error = connect_async(third).await.unwrap_err();
+        assert!(
+            matches!(error, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status()==429)
+        );
+        p.feed.shutdown.cancel();
+        task.await.unwrap();
+        clients_released(&p.feed).await;
     })
-    .await
-    .unwrap();
-    assert_eq!(decode(&data).0["sequence"], 1);
-    assert_eq!(decode(&data).1, &[0, 255, 7, 0x7e]);
-    let mut second = connect(&url).await;
-    let _ = second.next().await.unwrap().unwrap();
-    let mut third = url.as_str().into_client_request().unwrap();
-    third
-        .headers_mut()
-        .insert("Sec-WebSocket-Protocol", PROTOCOL.parse().unwrap());
-    let error = connect_async(third).await.unwrap_err();
-    assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status()==429));
-    p.feed.shutdown.cancel();
-    timeout(Duration::from_secs(3), task)
-        .await
-        .unwrap()
-        .unwrap();
-    timeout(Duration::from_secs(3), async {
-        while p.feed.clients.available_permits() != MAX_CLIENTS {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    .await;
 }
 #[tokio::test]
 async fn websocket_rejects_browser_origin_and_unknown_protocol() {
-    let p = publisher();
-    let (url, task) = test_server(&p).await;
-    let mut request = url.as_str().into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("Origin", "https://untrusted.invalid".parse().unwrap());
-    request
-        .headers_mut()
-        .insert("Sec-WebSocket-Protocol", PROTOCOL.parse().unwrap());
-    let error = connect_async(request).await.unwrap_err();
-    assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status()==403));
-    let error = connect_async(&url).await.unwrap_err();
-    assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status()==400));
-    assert_eq!(p.feed.clients.available_permits(), MAX_CLIENTS);
-    p.feed.shutdown.cancel();
-    task.await.unwrap();
+    manual_time(async {
+        let p = publisher();
+        let (url, task) = test_server(&p).await;
+        let mut request = url.as_str().into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Origin", "https://untrusted.invalid".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", PROTOCOL.parse().unwrap());
+        let error = connect_async(request).await.unwrap_err();
+        assert!(
+            matches!(error, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status()==403)
+        );
+        let error = connect_async(&url).await.unwrap_err();
+        assert!(
+            matches!(error, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status()==400)
+        );
+        assert_eq!(p.feed.clients.available_permits(), MAX_CLIENTS);
+        p.feed.shutdown.cancel();
+        task.await.unwrap();
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn websocket_lag_reports_byte_eviction_and_reader_end() {
-    let mut p = publisher();
-    let feed = p.feed.clone();
-    let (url, task) = test_server(&p).await;
-    let mut ws = connect(&url).await;
-    let _hello = ws.next().await.unwrap().unwrap();
-    // Current-thread runtime: no network consumer runs during this burst.
-    for _ in 0..100 {
-        p.publish(&vec![42; MAX_READ]);
-    }
-    assert!(feed.buffer.lock().unwrap().bytes <= MAX_BYTES);
-    let first_retained = feed
-        .buffer
-        .lock()
-        .unwrap()
-        .records
-        .front()
-        .unwrap()
-        .sequence;
-    assert!(first_retained > 36); // byte budget, not just the 64-record limit
-    drop(p);
-    let mut saw_gap = false;
-    let mut saw_end = false;
-    let mut expected = first_retained;
-    timeout(Duration::from_secs(3), async {
+    manual_time(async {
+        let mut p = publisher();
+        let feed = p.feed.clone();
+        let (url, task) = test_server(&p).await;
+        let mut ws = connect(&url).await;
+        let _hello = ws.next().await.unwrap().unwrap();
+        // Current-thread runtime: no network consumer runs during this burst.
+        for _ in 0..100 {
+            p.publish(&vec![42; MAX_READ]);
+        }
+        assert!(feed.buffer.lock().unwrap().bytes <= MAX_BYTES);
+        let first_retained = feed
+            .buffer
+            .lock()
+            .unwrap()
+            .records
+            .front()
+            .unwrap()
+            .sequence;
+        assert!(first_retained > 36); // byte budget, not just the 64-record limit
+        drop(p);
+        let mut saw_gap = false;
+        let mut saw_end = false;
+        let mut expected = first_retained;
         while let Some(Ok(message)) = ws.next().await {
             match message {
                 ClientMessage::Text(text) => {
@@ -296,53 +334,39 @@ async fn websocket_lag_reports_byte_eviction_and_reader_end() {
                 _ => {}
             }
         }
+        assert_eq!(expected, 100);
+        assert!(saw_end);
+        feed.shutdown.cancel();
+        task.await.unwrap();
     })
-    .await
-    .unwrap();
-    assert_eq!(expected, 100);
-    assert!(saw_end);
-    feed.shutdown.cancel();
-    task.await.unwrap();
+    .await;
 }
 
 #[tokio::test]
 async fn disconnect_releases_slot_and_reconnect_has_new_live_baseline() {
-    let mut p = publisher();
-    let (url, task) = test_server(&p).await;
-    let mut ws = connect(&url).await;
-    let _ = ws.next().await.unwrap().unwrap();
-    ws.close(None).await.unwrap();
-    drop(ws);
-    timeout(Duration::from_secs(2), async {
-        while p.feed.clients.available_permits() != MAX_CLIENTS {
-            tokio::task::yield_now().await;
-        }
+    manual_time(async {
+        let mut p = publisher();
+        let (url, task) = test_server(&p).await;
+        let mut ws = connect(&url).await;
+        let _ = ws.next().await.unwrap().unwrap();
+        ws.close(None).await.unwrap();
+        drop(ws);
+        clients_released(&p.feed).await;
+        p.publish(b"while disconnected");
+        let mut ws = connect(&url).await;
+        let hello = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(hello["next_sequence"], 1);
+        // Idle cancellation must close the upgraded connection as well as listener.
+        p.feed.shutdown.cancel();
+        task.await.unwrap();
+        while matches!(ws.next().await, Some(Ok(ClientMessage::Text(_)))) {}
+        clients_released(&p.feed).await;
     })
-    .await
-    .unwrap();
-    p.publish(b"while disconnected");
-    let mut ws = connect(&url).await;
-    let hello = ws.next().await.unwrap().unwrap().into_text().unwrap();
-    let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
-    assert_eq!(hello["next_sequence"], 1);
-    // Idle cancellation must close the upgraded connection as well as listener.
-    p.feed.shutdown.cancel();
-    timeout(Duration::from_secs(2), task)
-        .await
-        .unwrap()
-        .unwrap();
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if !matches!(ws.next().await, Some(Ok(ClientMessage::Text(_)))) {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
+    .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stalled_sink_has_a_send_deadline() {
     struct Stalled;
     impl futures::Sink<Message> for Stalled {
@@ -369,38 +393,39 @@ async fn stalled_sink_has_a_send_deadline() {
             std::task::Poll::Pending
         }
     }
-    assert!(
-        timeout(
-            SEND_TIMEOUT + Duration::from_secs(1),
-            send(&mut Stalled, Message::Text("test".into()))
-        )
-        .await
-        .unwrap()
-        .is_err()
-    );
+    for lateness in [Duration::ZERO, Duration::from_millis(1)] {
+        use std::future::Future;
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut sink = Stalled;
+        let sending = send(&mut sink, Message::Text("test".into()));
+        tokio::pin!(sending);
+        // Poll first so the production timeout registers at this controlled origin.
+        assert!(sending.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(SEND_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(sending.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_millis(1) + lateness).await;
+        assert_eq!(
+            sending.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(()))
+        );
+    }
 }
 
 #[tokio::test]
 async fn busy_stream_cancellation_releases_clients() {
-    let mut p = publisher();
-    let (url, task) = test_server(&p).await;
-    let mut ws = connect(&url).await;
-    let _ = ws.next().await.unwrap().unwrap();
-    for _ in 0..100 {
-        p.publish(&vec![42; MAX_READ]);
-    }
-    p.feed.shutdown.cancel();
-    timeout(Duration::from_secs(2), task)
-        .await
-        .unwrap()
-        .unwrap();
-    timeout(Duration::from_secs(2), async {
-        while p.feed.clients.available_permits() != MAX_CLIENTS {
-            tokio::task::yield_now().await;
+    manual_time(async {
+        let mut p = publisher();
+        let (url, task) = test_server(&p).await;
+        let mut ws = connect(&url).await;
+        let _ = ws.next().await.unwrap().unwrap();
+        for _ in 0..100 {
+            p.publish(&vec![42; MAX_READ]);
         }
+        p.feed.shutdown.cancel();
+        task.await.unwrap();
+        clients_released(&p.feed).await;
     })
-    .await
-    .unwrap();
+    .await;
 }
 
 #[test]

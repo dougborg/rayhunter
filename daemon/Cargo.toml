@@ -55,6 +55,7 @@ utoipa = { version = "5.4.0", features = ["repr"], optional = true }
 url = "2.5.4"
 
 [dev-dependencies]
+tokio = { version = "1.44.2", default-features = false, features = ["test-util"] }
 reqwest = { version = "0.12.20", default-features = false, features = ["gzip"] }
 tempfile = "3.10.2"
 
